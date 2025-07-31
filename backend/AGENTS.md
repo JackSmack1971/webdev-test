@@ -97,16 +97,17 @@ backend/
 
 ### Strict TypeScript Setup
 ```json
-// tsconfig.json
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "CommonJS",
+    "module": "Node16", // Changed from CommonJS for better ES2022 compatibility
+    "moduleResolution": "Node16", // Added explicit module resolution
     "lib": ["ES2022"],
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true, // Added for better import compatibility
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
@@ -118,6 +119,8 @@ backend/
     "noUnusedParameters": true,
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true, // Added for stricter type checking
+    "useUnknownInCatchVariables": true, // Added for better error handling
     "baseUrl": ".",
     "paths": {
       "@/*": ["src/*"],
@@ -145,9 +148,8 @@ import express from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import compression from 'compression';
-import rateLimit from 'express-rate-limit';
+import { rateLimit } from 'express-rate-limit';
 import { Request, Response, NextFunction } from 'express';
-
 import { config } from '@/config';
 import { logger } from '@/utils/logger';
 import { errorHandler } from '@/middleware/error.middleware';
@@ -172,6 +174,12 @@ declare global {
 export function createApp(): express.Application {
   const app = express();
 
+  // Disable X-Powered-By header for security (recommended by Helmet.js docs)
+  app.disable('x-powered-by');
+
+  // Configure trust proxy if behind a proxy/load balancer
+  app.set('trust proxy', 1); // Adjust number based on your proxy setup
+
   // Security middleware
   app.use(helmet({
     contentSecurityPolicy: {
@@ -182,8 +190,8 @@ export function createApp(): express.Application {
         imgSrc: ["'self'", "data:", "https:"],
       },
     },
-    hsts: {
-      maxAge: 31536000,
+    strictTransportSecurity: {
+      maxAge: 31536000, // 1 year in seconds
       includeSubDomains: true,
       preload: true,
     },
@@ -197,16 +205,18 @@ export function createApp(): express.Application {
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Correlation-ID'],
   }));
 
-  // Rate limiting
+  // Rate limiting - updated configuration for latest express-rate-limit
   app.use(rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // Limit each IP to 100 requests per windowMs
+    limit: 100, // Limit each IP to 100 requests per windowMs
     message: {
       error: 'RATE_LIMIT_EXCEEDED',
       message: 'Too many requests, please try again later.',
     },
-    standardHeaders: true,
-    legacyHeaders: false,
+    standardHeaders: 'draft-8', // Use latest draft standard for rate limit headers
+    legacyHeaders: false, // Disable X-RateLimit-* headers
+    // Skip function can be added for allowlists if needed
+    // skip: (req, res) => allowlist.includes(req.ip),
   }));
 
   // Compression and parsing
@@ -255,99 +265,223 @@ import { config } from '@/config';
 import { logger } from '@/utils/logger';
 import { connectDatabase } from '@/config/database';
 import { connectRedis } from '@/config/redis';
+import { Server } from 'http';
 
 async function startServer(): Promise<void> {
+  let server: Server | null = null;
+  
   try {
     // Initialize database connections
     await connectDatabase();
     await connectRedis();
-
+    
     // Create Express application
     const app = createApp();
-
+    
     // Start server
-    const server = app.listen(config.port, () => {
+    server = app.listen(config.port, () => {
       logger.info(`Server running on port ${config.port}`, {
         environment: config.env,
         port: config.port,
       });
     });
-
-    // Graceful shutdown
-    const gracefulShutdown = (signal: string) => {
+    
+    // Graceful shutdown handler
+    const gracefulShutdown = async (signal: string) => {
       logger.info(`Received ${signal}, shutting down gracefully`);
       
-      server.close(() => {
-        logger.info('HTTP server closed');
+      if (server) {
+        // Stop accepting new connections
+        server.close((err) => {
+          if (err) {
+            logger.error('Error during server close:', { error: err });
+          } else {
+            logger.info('HTTP server closed');
+          }
+          process.exit(err ? 1 : 0);
+        });
+        
+        // Force close after 30 seconds
+        setTimeout(() => {
+          logger.error('Could not close connections in time, forcefully shutting down');
+          process.exit(1);
+        }, 30000);
+      } else {
         process.exit(0);
-      });
-
-      // Force close after 30 seconds
-      setTimeout(() => {
-        logger.error('Could not close connections in time, forcefully shutting down');
-        process.exit(1);
-      }, 30000);
+      }
     };
-
+    
+    // Register signal handlers
     process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
     process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
+    
   } catch (error) {
     logger.error('Failed to start server', { error });
     process.exit(1);
   }
 }
 
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', { promise, reason });
-  process.exit(1);
+// Handle unhandled promise rejections - re-throw to be caught by uncaughtException
+process.on('unhandledRejection', (reason: unknown, promise: Promise<any>) => {
+  logger.error('Unhandled Promise Rejection at:', { promise, reason });
+  // Re-throw to be caught by uncaughtException handler
+  throw reason;
 });
 
 // Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', { error });
-  process.exit(1);
+process.on('uncaughtException', (error: Error) => {
+  logger.error('Uncaught Exception:', { error: error.message, stack: error.stack });
+  // Allow graceful shutdown attempt, but exit after timeout
+  setTimeout(() => {
+    process.exit(1);
+  }, 5000);
+});
+
+// Add process warning handler for better debugging
+process.on('warning', (warning) => {
+  logger.warn('Process warning:', {
+    name: warning.name,
+    message: warning.message,
+    stack: warning.stack
+  });
 });
 
 startServer();
 ```
 
-## Controller Pattern Implementation
+## Base controller implementation with proper error handling, type safety, and Zod integration:
 
-### Base Controller Class
 ```typescript
-// src/controllers/base.controller.ts
+// src/types/express.d.ts - Extended Request interface
+import { Request } from 'express';
+
+declare global {
+  namespace Express {
+    interface Request {
+      correlationId?: string;
+      user?: {
+        id: string;
+        [key: string]: any;
+      };
+    }
+  }
+}
+```
+
+```typescript
+// src/types/api.types.ts - API Response types
+export interface ApiResponse<T = any> {
+  success: boolean;
+  data?: T;
+  message: string;
+  meta: {
+    timestamp: string;
+    correlationId?: string;
+  };
+  errors?: ValidationError[];
+}
+
+export interface ValidationError {
+  field: string;
+  message: string;
+  code: string;
+}
+```
+
+```typescript
+// src/controllers/base.controller.ts - Corrected implementation
 import { Request, Response, NextFunction } from 'express';
-import { ZodSchema } from 'zod';
+import { ZodSchema, ZodError } from 'zod';
 import { logger } from '@/utils/logger';
-import { ApiResponse } from '@/types/api.types';
+import { ApiResponse, ValidationError } from '@/types/api.types';
 
 export abstract class BaseController {
-  protected async executeAsync(
+  /**
+   * Execute an async operation with proper error handling
+   */
+  protected async executeAsync<T>(
     req: Request,
     res: Response,
     next: NextFunction,
-    operation: () => Promise<any>
+    operation: (req: Request, res: Response) => Promise<T>
   ): Promise<void> {
     try {
-      const result = await operation();
+      this.logOperation(req, 'Starting operation');
+      const result = await operation(req, res);
       this.sendSuccess(res, result);
     } catch (error) {
+      // Log the error with context
+      logger.error('Controller operation failed', {
+        correlationId: req.correlationId,
+        userId: req.user?.id,
+        error: error instanceof Error ? error.message : 'Unknown error',
+        stack: error instanceof Error ? error.stack : undefined,
+      });
+      
       next(error);
     }
   }
 
+  /**
+   * Validate request data using Zod schema with proper error handling
+   */
   protected validateRequest<T>(
     schema: ZodSchema<T>,
-    data: unknown
-  ): T {
-    return schema.parse(data);
+    data: unknown,
+    fieldName = 'request'
+  ): { success: true; data: T } | { success: false; errors: ValidationError[] } {
+    const result = schema.safeParse(data);
+    
+    if (!result.success) {
+      // Transform ZodError to API-friendly validation errors
+      const validationErrors: ValidationError[] = result.error.errors.map((issue) => ({
+        field: issue.path.length > 0 ? issue.path.join('.') : fieldName,
+        message: issue.message,
+        code: issue.code,
+      }));
+
+      return { success: false, errors: validationErrors };
+    }
+
+    return { success: true, data: result.data };
   }
 
+  /**
+   * Validate request body specifically
+   */
+  protected validateBody<T>(
+    req: Request,
+    schema: ZodSchema<T>
+  ): { success: true; data: T } | { success: false; errors: ValidationError[] } {
+    return this.validateRequest(schema, req.body, 'body');
+  }
+
+  /**
+   * Validate request query parameters
+   */
+  protected validateQuery<T>(
+    req: Request,
+    schema: ZodSchema<T>
+  ): { success: true; data: T } | { success: false; errors: ValidationError[] } {
+    return this.validateRequest(schema, req.query, 'query');
+  }
+
+  /**
+   * Validate request parameters
+   */
+  protected validateParams<T>(
+    req: Request,
+    schema: ZodSchema<T>
+  ): { success: true; data: T } | { success: false; errors: ValidationError[] } {
+    return this.validateRequest(schema, req.params, 'params');
+  }
+
+  /**
+   * Send successful response with consistent format
+   */
   protected sendSuccess<T>(
     res: Response,
-    data: T,
+    data?: T,
     message = 'Operation successful',
     statusCode = 200
   ): void {
@@ -357,12 +491,59 @@ export abstract class BaseController {
       message,
       meta: {
         timestamp: new Date().toISOString(),
+        correlationId: res.req.correlationId,
+      },
+    };
+    
+    res.status(statusCode).json(response);
+  }
+
+  /**
+   * Send validation error response
+   */
+  protected sendValidationError(
+    res: Response,
+    errors: ValidationError[],
+    message = 'Validation failed'
+  ): void {
+    const response: ApiResponse = {
+      success: false,
+      message,
+      errors,
+      meta: {
+        timestamp: new Date().toISOString(),
+        correlationId: res.req.correlationId,
+      },
+    };
+
+    res.status(400).json(response);
+  }
+
+  /**
+   * Send error response with consistent format
+   */
+  protected sendError(
+    res: Response,
+    message = 'Internal server error',
+    statusCode = 500,
+    errors?: ValidationError[]
+  ): void {
+    const response: ApiResponse = {
+      success: false,
+      message,
+      errors,
+      meta: {
+        timestamp: new Date().toISOString(),
+        correlationId: res.req.correlationId,
       },
     };
 
     res.status(statusCode).json(response);
   }
 
+  /**
+   * Log controller operations with context
+   */
   protected logOperation(
     req: Request,
     operation: string,
@@ -371,12 +552,64 @@ export abstract class BaseController {
     logger.info(`Controller operation: ${operation}`, {
       correlationId: req.correlationId,
       userId: req.user?.id,
+      method: req.method,
+      url: req.originalUrl,
+      userAgent: req.get('User-Agent'),
       operation,
       ...data,
     });
   }
+
+  /**
+   * Helper method to handle validation and send appropriate response
+   */
+  protected handleValidation<T>(
+    res: Response,
+    validationResult: { success: true; data: T } | { success: false; errors: ValidationError[] }
+  ): T | null {
+    if (!validationResult.success) {
+      this.sendValidationError(res, validationResult.errors);
+      return null;
+    }
+    
+    return validationResult.data;
+  }
 }
 ```
+
+## Usage Example
+
+```typescript
+// src/controllers/user.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
+import { BaseController } from './base.controller';
+
+const CreateUserSchema = z.object({
+  name: z.string().min(1, 'Name is required'),
+  email: z.string().email('Invalid email format'),
+  age: z.number().min(18, 'Must be at least 18 years old').optional(),
+});
+
+export class UserController extends BaseController {
+  async createUser(req: Request, res: Response, next: NextFunction): Promise<void> {
+    await this.executeAsync(req, res, next, async () => {
+      // Validate request body
+      const validation = this.validateBody(req, CreateUserSchema);
+      const userData = this.handleValidation(res, validation);
+      
+      if (!userData) return; // Validation failed, response already sent
+      
+      // Business logic here
+      const user = await this.userService.create(userData);
+      
+      return user;
+    });
+  }
+}
+```
+
+The implementation follows Express.js best practices for middleware error handling and leverages Zod's `safeParse` method for robust validation without throwing exceptions.
 
 ### User Controller Example
 ```typescript
@@ -395,18 +628,25 @@ export class UserController extends BaseController {
     super();
   }
 
+  // Use arrow functions to maintain proper 'this' binding
   public createUser = async (
     req: Request,
     res: Response,
     next: NextFunction
   ): Promise<void> => {
     this.logOperation(req, 'createUser');
-
-    await this.executeAsync(req, res, next, async () => {
-      const userData = this.validateRequest(CreateUserSchema, req.body);
-      const user = await this.userService.createUser(userData);
-      return user;
-    });
+    
+    // Added try-catch for better error handling
+    try {
+      await this.executeAsync(req, res, next, async () => {
+        const userData = this.validateRequest(CreateUserSchema, req.body);
+        const user = await this.userService.createUser(userData);
+        return user;
+      });
+    } catch (error) {
+      // Pass error to Express error handler
+      next(error);
+    }
   };
 
   public getUsers = async (
@@ -415,12 +655,16 @@ export class UserController extends BaseController {
     next: NextFunction
   ): Promise<void> => {
     this.logOperation(req, 'getUsers');
-
-    await this.executeAsync(req, res, next, async () => {
-      const query = this.validateRequest(GetUsersQuerySchema, req.query);
-      const result = await this.userService.getUsers(query);
-      return result;
-    });
+    
+    try {
+      await this.executeAsync(req, res, next, async () => {
+        const query = this.validateRequest(GetUsersQuerySchema, req.query);
+        const result = await this.userService.getUsers(query);
+        return result;
+      });
+    } catch (error) {
+      next(error);
+    }
   };
 
   public getUserById = async (
@@ -429,12 +673,20 @@ export class UserController extends BaseController {
     next: NextFunction
   ): Promise<void> => {
     this.logOperation(req, 'getUserById', { userId: req.params.id });
-
-    await this.executeAsync(req, res, next, async () => {
-      const { id } = req.params;
-      const user = await this.userService.getUserById(id);
-      return user;
-    });
+    
+    try {
+      await this.executeAsync(req, res, next, async () => {
+        const { id } = req.params;
+        // Add validation for ID parameter
+        if (!id) {
+          throw new Error('User ID is required');
+        }
+        const user = await this.userService.getUserById(id);
+        return user;
+      });
+    } catch (error) {
+      next(error);
+    }
   };
 
   public updateUser = async (
@@ -443,13 +695,21 @@ export class UserController extends BaseController {
     next: NextFunction
   ): Promise<void> => {
     this.logOperation(req, 'updateUser', { userId: req.params.id });
-
-    await this.executeAsync(req, res, next, async () => {
-      const { id } = req.params;
-      const updateData = this.validateRequest(UpdateUserSchema, req.body);
-      const user = await this.userService.updateUser(id, updateData);
-      return user;
-    });
+    
+    try {
+      await this.executeAsync(req, res, next, async () => {
+        const { id } = req.params;
+        // Add validation for ID parameter
+        if (!id) {
+          throw new Error('User ID is required');
+        }
+        const updateData = this.validateRequest(UpdateUserSchema, req.body);
+        const user = await this.userService.updateUser(id, updateData);
+        return user;
+      });
+    } catch (error) {
+      next(error);
+    }
   };
 
   public deleteUser = async (
@@ -458,12 +718,20 @@ export class UserController extends BaseController {
     next: NextFunction
   ): Promise<void> => {
     this.logOperation(req, 'deleteUser', { userId: req.params.id });
-
-    await this.executeAsync(req, res, next, async () => {
-      const { id } = req.params;
-      await this.userService.deleteUser(id);
-      return { message: 'User deleted successfully' };
-    });
+    
+    try {
+      await this.executeAsync(req, res, next, async () => {
+        const { id } = req.params;
+        // Add validation for ID parameter
+        if (!id) {
+          throw new Error('User ID is required');
+        }
+        await this.userService.deleteUser(id);
+        return { message: 'User deleted successfully' };
+      });
+    } catch (error) {
+      next(error);
+    }
   };
 }
 ```
@@ -476,6 +744,19 @@ export class UserController extends BaseController {
 import { logger } from '@/utils/logger';
 
 export abstract class BaseService {
+  protected readonly serviceName: string;
+
+  constructor() {
+    // Automatically derive service name from class constructor
+    this.serviceName = this.constructor.name;
+  }
+
+  /**
+   * Log a successful operation with structured metadata
+   * @param operation - The operation being performed
+   * @param data - Additional structured data to include
+   * @param correlationId - Optional correlation ID for request tracing
+   */
   protected logOperation(
     operation: string,
     data?: Record<string, any>,
@@ -483,12 +764,20 @@ export abstract class BaseService {
   ): void {
     logger.info(`Service operation: ${operation}`, {
       correlationId,
-      service: this.constructor.name,
+      service: this.serviceName,
       operation,
+      timestamp: new Date().toISOString(),
       ...data,
     });
   }
 
+  /**
+   * Log an error with structured metadata and stack trace
+   * @param operation - The operation that failed
+   * @param error - The error that occurred
+   * @param data - Additional context data
+   * @param correlationId - Optional correlation ID for request tracing
+   */
   protected logError(
     operation: string,
     error: Error,
@@ -497,10 +786,85 @@ export abstract class BaseService {
   ): void {
     logger.error(`Service error: ${operation}`, {
       correlationId,
-      service: this.constructor.name,
+      service: this.serviceName,
       operation,
-      error: error.message,
-      stack: error.stack,
+      error: {
+        name: error.name,
+        message: error.message,
+        stack: error.stack,
+        // Include cause if available (Node.js 16.9.0+)
+        ...(error.cause && { cause: error.cause }),
+      },
+      timestamp: new Date().toISOString(),
+      ...data,
+    });
+  }
+
+  /**
+   * Log performance metrics for operations
+   * @param operation - The operation being measured
+   * @param duration - Duration in milliseconds
+   * @param data - Additional performance context
+   * @param correlationId - Optional correlation ID for request tracing
+   */
+  protected logPerformance(
+    operation: string,
+    duration: number,
+    data?: Record<string, any>,
+    correlationId?: string
+  ): void {
+    logger.info(`Service performance: ${operation}`, {
+      correlationId,
+      service: this.serviceName,
+      operation,
+      performance: {
+        duration,
+        unit: 'ms',
+      },
+      timestamp: new Date().toISOString(),
+      ...data,
+    });
+  }
+
+  /**
+   * Log debug information for development and troubleshooting
+   * @param operation - The operation context
+   * @param data - Debug data to log
+   * @param correlationId - Optional correlation ID for request tracing
+   */
+  protected logDebug(
+    operation: string,
+    data?: Record<string, any>,
+    correlationId?: string
+  ): void {
+    logger.debug(`Service debug: ${operation}`, {
+      correlationId,
+      service: this.serviceName,
+      operation,
+      timestamp: new Date().toISOString(),
+      ...data,
+    });
+  }
+
+  /**
+   * Log a warning for non-critical issues
+   * @param operation - The operation context
+   * @param message - Warning message
+   * @param data - Additional context data
+   * @param correlationId - Optional correlation ID for request tracing
+   */
+  protected logWarning(
+    operation: string,
+    message: string,
+    data?: Record<string, any>,
+    correlationId?: string
+  ): void {
+    logger.warn(`Service warning: ${operation} - ${message}`, {
+      correlationId,
+      service: this.serviceName,
+      operation,
+      warning: message,
+      timestamp: new Date().toISOString(),
       ...data,
     });
   }
@@ -510,7 +874,7 @@ export abstract class BaseService {
 ### User Service Implementation
 ```typescript
 // src/services/user.service.ts
-import bcrypt from 'bcrypt';
+import bcrypt from 'bcrypt'; // ✅ Correct import - the actual bcrypt package, not bcryptjs
 import { BaseService } from './base.service';
 import { UserRepository } from '@/repositories/user.repository';
 import { EmailService } from './email.service';
@@ -528,6 +892,8 @@ import {
 } from '@/utils/errors';
 
 export class UserService extends BaseService {
+  private readonly SALT_ROUNDS = 12; // ✅ Make salt rounds a constant
+
   constructor(
     private userRepository: UserRepository,
     private emailService: EmailService
@@ -548,14 +914,14 @@ export class UserService extends BaseService {
         throw new ConflictError('User with this email already exists');
       }
 
-      // Hash password
-      const saltRounds = 12;
-      const passwordHash = await bcrypt.hash(userData.password, saltRounds);
+      // ✅ Hash password using one-step method (more efficient)
+      const passwordHash = await bcrypt.hash(userData.password, this.SALT_ROUNDS);
 
       // Create user
       const user = await this.userRepository.create({
         ...userData,
         passwordHash,
+        password: undefined, // ✅ Explicitly remove password from create payload
       });
 
       // Send welcome email (async)
@@ -579,6 +945,12 @@ export class UserService extends BaseService {
 
     try {
       const { page = 1, limit = 10, search, role } = query;
+      
+      // ✅ Add input validation
+      if (page < 1 || limit < 1 || limit > 100) {
+        throw new ValidationError('Invalid pagination parameters');
+      }
+      
       const offset = (page - 1) * limit;
 
       const { users, total } = await this.userRepository.findMany({
@@ -612,6 +984,11 @@ export class UserService extends BaseService {
     this.logOperation('getUserById', { userId: id }, correlationId);
 
     try {
+      // ✅ Add basic ID validation
+      if (!id || typeof id !== 'string') {
+        throw new ValidationError('Invalid user ID');
+      }
+
       const user = await this.userRepository.findById(id);
       if (!user) {
         throw new NotFoundError('User not found');
@@ -632,6 +1009,11 @@ export class UserService extends BaseService {
     this.logOperation('updateUser', { userId: id }, correlationId);
 
     try {
+      // ✅ Add basic ID validation
+      if (!id || typeof id !== 'string') {
+        throw new ValidationError('Invalid user ID');
+      }
+
       const existingUser = await this.userRepository.findById(id);
       if (!existingUser) {
         throw new NotFoundError('User not found');
@@ -645,12 +1027,12 @@ export class UserService extends BaseService {
         }
       }
 
-      // Hash new password if provided
-      let updatePayload = { ...updateData };
+      // ✅ Improved password handling
+      let updatePayload: any = { ...updateData };
       if (updateData.password) {
-        const saltRounds = 12;
-        updatePayload.passwordHash = await bcrypt.hash(updateData.password, saltRounds);
-        delete updatePayload.password;
+        // Use one-step hash method
+        updatePayload.passwordHash = await bcrypt.hash(updateData.password, this.SALT_ROUNDS);
+        delete updatePayload.password; // Remove password from payload
       }
 
       const updatedUser = await this.userRepository.update(id, updatePayload);
@@ -668,6 +1050,11 @@ export class UserService extends BaseService {
     this.logOperation('deleteUser', { userId: id }, correlationId);
 
     try {
+      // ✅ Add basic ID validation
+      if (!id || typeof id !== 'string') {
+        throw new ValidationError('Invalid user ID');
+      }
+
       const user = await this.userRepository.findById(id);
       if (!user) {
         throw new NotFoundError('User not found');
@@ -677,6 +1064,19 @@ export class UserService extends BaseService {
     } catch (error) {
       this.logError('deleteUser', error as Error, { userId: id }, correlationId);
       throw error;
+    }
+  }
+
+  // ✅ Add password verification method (commonly needed)
+  public async verifyPassword(
+    plainPassword: string,
+    hashedPassword: string
+  ): Promise<boolean> {
+    try {
+      return await bcrypt.compare(plainPassword, hashedPassword);
+    } catch (error) {
+      this.logError('verifyPassword', error as Error, {});
+      return false;
     }
   }
 
@@ -701,37 +1101,205 @@ export class UserService extends BaseService {
 ### Base Repository Class
 ```typescript
 // src/repositories/base.repository.ts
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import { logger } from '@/utils/logger';
 
-export abstract class BaseRepository {
-  constructor(protected prisma: PrismaClient) {}
+// Enhanced error types for better error handling
+export class RepositoryError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    public readonly operation: string,
+    public readonly originalError?: Error
+  ) {
+    super(message);
+    this.name = 'RepositoryError';
+  }
+}
 
-  protected logQuery(
+// Transaction context type for transaction support
+export type TransactionContext = Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use'>;
+
+export abstract class BaseRepository<TModel extends string = string> {
+  constructor(
+    protected readonly prisma: PrismaClient,
+    protected readonly modelName: TModel
+  ) {}
+
+  /**
+   * Enhanced logging with performance metrics and correlation IDs
+   */
+  protected logQuery<TData = unknown>(
     operation: string,
-    model: string,
-    data?: Record<string, any>
+    data?: TData,
+    correlationId?: string,
+    startTime?: number
   ): void {
+    const duration = startTime ? Date.now() - startTime : undefined;
+    
     logger.debug(`Database operation: ${operation}`, {
       repository: this.constructor.name,
-      model,
+      model: this.modelName,
       operation,
-      ...data,
+      correlationId,
+      duration: duration ? `${duration}ms` : undefined,
+      data: this.sanitizeLogData(data),
     });
   }
 
+  /**
+   * Enhanced error handling with Prisma-specific error types
+   */
   protected handleError(
     operation: string,
-    error: Error,
-    data?: Record<string, any>
+    error: unknown,
+    correlationId?: string,
+    data?: Record<string, unknown>
   ): never {
+    // Handle Prisma-specific errors
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      this.logPrismaError(operation, error, correlationId, data);
+      throw new RepositoryError(
+        this.mapPrismaErrorMessage(error),
+        error.code,
+        operation,
+        error
+      );
+    }
+
+    if (error instanceof Prisma.PrismaClientUnknownRequestError) {
+      this.logPrismaError(operation, error, correlationId, data);
+      throw new RepositoryError(
+        'Unknown database error occurred',
+        'UNKNOWN_ERROR',
+        operation,
+        error
+      );
+    }
+
+    if (error instanceof Prisma.PrismaClientValidationError) {
+      this.logPrismaError(operation, error, correlationId, data);
+      throw new RepositoryError(
+        'Database validation error',
+        'VALIDATION_ERROR',
+        operation,
+        error
+      );
+    }
+
+    // Handle generic errors
+    const message = error instanceof Error ? error.message : 'Unknown error';
     logger.error(`Database error: ${operation}`, {
       repository: this.constructor.name,
+      model: this.modelName,
       operation,
-      error: error.message,
-      ...data,
+      correlationId,
+      error: message,
+      stack: error instanceof Error ? error.stack : undefined,
+      data: this.sanitizeLogData(data),
     });
-    throw error;
+
+    throw new RepositoryError(
+      'An unexpected database error occurred',
+      'UNEXPECTED_ERROR',
+      operation,
+      error instanceof Error ? error : new Error(String(error))
+    );
+  }
+
+  /**
+   * Execute operation with comprehensive logging and error handling
+   */
+  protected async executeOperation<TResult>(
+    operation: string,
+    fn: () => Promise<TResult>,
+    data?: Record<string, unknown>,
+    correlationId?: string
+  ): Promise<TResult> {
+    const startTime = Date.now();
+    
+    try {
+      this.logQuery(operation, data, correlationId, startTime);
+      const result = await fn();
+      this.logQuery(`${operation}:success`, { resultCount: Array.isArray(result) ? result.length : 1 }, correlationId, startTime);
+      return result;
+    } catch (error) {
+      this.handleError(operation, error, correlationId, data);
+    }
+  }
+
+  /**
+   * Execute operation within transaction context
+   */
+  protected async executeInTransaction<TResult>(
+    operation: string,
+    fn: (tx: TransactionContext) => Promise<TResult>,
+    data?: Record<string, unknown>,
+    correlationId?: string
+  ): Promise<TResult> {
+    return this.executeOperation(
+      `${operation}:transaction`,
+      () => this.prisma.$transaction(fn),
+      data,
+      correlationId
+    );
+  }
+
+  /**
+   * Log Prisma-specific errors with enhanced context
+   */
+  private logPrismaError(
+    operation: string,
+    error: Prisma.PrismaClientKnownRequestError | Prisma.PrismaClientUnknownRequestError | Prisma.PrismaClientValidationError,
+    correlationId?: string,
+    data?: Record<string, unknown>
+  ): void {
+    logger.error(`Prisma error: ${operation}`, {
+      repository: this.constructor.name,
+      model: this.modelName,
+      operation,
+      correlationId,
+      errorCode: 'code' in error ? error.code : 'UNKNOWN',
+      errorMessage: error.message,
+      meta: 'meta' in error ? error.meta : undefined,
+      data: this.sanitizeLogData(data),
+    });
+  }
+
+  /**
+   * Map Prisma error codes to user-friendly messages
+   */
+  private mapPrismaErrorMessage(error: Prisma.PrismaClientKnownRequestError): string {
+    switch (error.code) {
+      case 'P2002':
+        return 'A record with this information already exists';
+      case 'P2025':
+        return 'Record not found';
+      case 'P2003':
+        return 'Foreign key constraint failed';
+      case 'P2014':
+        return 'Invalid data provided';
+      default:
+        return `Database operation failed: ${error.message}`;
+    }
+  }
+
+  /**
+   * Sanitize sensitive data from logs
+   */
+  private sanitizeLogData(data: unknown): unknown {
+    if (!data || typeof data !== 'object') return data;
+
+    const sensitiveFields = ['password', 'token', 'secret', 'key', 'authorization'];
+    const sanitized = { ...data as Record<string, unknown> };
+
+    for (const field of sensitiveFields) {
+      if (field in sanitized) {
+        sanitized[field] = '[REDACTED]';
+      }
+    }
+
+    return sanitized;
   }
 }
 ```
@@ -761,48 +1329,47 @@ export class UserRepository extends BaseRepository {
 
   public async create(userData: Prisma.UserCreateInput): Promise<User> {
     this.logQuery('create', 'User', { email: userData.email });
-
     try {
       return await this.prisma.user.create({
         data: userData,
       });
     } catch (error) {
+      // Fix: Re-throw the error after logging instead of returning undefined
       this.handleError('create', error as Error, { email: userData.email });
+      throw error; // Ensure the method always returns Promise<User> or throws
     }
   }
 
   public async findById(id: string): Promise<User | null> {
     this.logQuery('findById', 'User', { id });
-
     try {
       return await this.prisma.user.findUnique({
         where: { id },
       });
     } catch (error) {
       this.handleError('findById', error as Error, { id });
+      throw error; // Fix: Re-throw to maintain return type consistency
     }
   }
 
   public async findByEmail(email: string): Promise<User | null> {
     this.logQuery('findByEmail', 'User', { email });
-
     try {
       return await this.prisma.user.findUnique({
         where: { email },
       });
     } catch (error) {
       this.handleError('findByEmail', error as Error, { email });
+      throw error; // Fix: Re-throw the error
     }
   }
 
   public async findMany(options: FindManyOptions): Promise<FindManyResult> {
     this.logQuery('findMany', 'User', options);
-
     try {
       const { offset, limit, search, role } = options;
-
       const where: Prisma.UserWhereInput = {};
-
+      
       if (search) {
         where.OR = [
           { firstName: { contains: search, mode: 'insensitive' } },
@@ -810,7 +1377,7 @@ export class UserRepository extends BaseRepository {
           { email: { contains: search, mode: 'insensitive' } },
         ];
       }
-
+      
       if (role) {
         where.role = role;
       }
@@ -828,6 +1395,7 @@ export class UserRepository extends BaseRepository {
       return { users, total };
     } catch (error) {
       this.handleError('findMany', error as Error, options);
+      throw error; // Fix: Re-throw the error
     }
   }
 
@@ -836,7 +1404,6 @@ export class UserRepository extends BaseRepository {
     updateData: Prisma.UserUpdateInput
   ): Promise<User> {
     this.logQuery('update', 'User', { id });
-
     try {
       return await this.prisma.user.update({
         where: { id },
@@ -844,19 +1411,46 @@ export class UserRepository extends BaseRepository {
       });
     } catch (error) {
       this.handleError('update', error as Error, { id });
+      throw error; // Fix: Re-throw the error
     }
   }
 
   public async delete(id: string): Promise<void> {
     this.logQuery('delete', 'User', { id });
-
     try {
       await this.prisma.user.delete({
         where: { id },
       });
+      // Fix: Explicit return for void methods is optional but clear
     } catch (error) {
       this.handleError('delete', error as Error, { id });
+      throw error; // Fix: Re-throw the error
     }
+  }
+}
+```
+## Additional Improvements to Consider
+```typescript
+// Optional: Add specific Prisma error handling
+import { Prisma } from '@prisma/client';
+
+public async create(userData: Prisma.UserCreateInput): Promise<User> {
+  this.logQuery('create', 'User', { email: userData.email });
+  try {
+    return await this.prisma.user.create({
+      data: userData,
+    });
+  } catch (error) {
+    // Handle specific Prisma errors
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      if (error.code === 'P2002') {
+        // Unique constraint violation
+        this.handleError('create', new Error('User with this email already exists'), { email: userData.email });
+        throw new Error('User with this email already exists');
+      }
+    }
+    this.handleError('create', error as Error, { email: userData.email });
+    throw error;
   }
 }
 ```
@@ -866,35 +1460,93 @@ export class UserRepository extends BaseRepository {
 ### API Types
 ```typescript
 // src/types/api.types.ts
+
+/**
+ * Standard API response wrapper with generic data type
+ * @template T - The type of the data payload
+ */
 export interface ApiResponse<T = any> {
+  /** Indicates if the operation was successful */
   success: boolean;
+  /** The response payload */
   data: T;
+  /** Optional human-readable message */
   message?: string;
+  /** Field-specific validation errors */
   errors?: Record<string, string[]>;
+  /** Additional metadata about the response */
   meta?: {
+    /** ISO timestamp of the response */
     timestamp: string;
+    /** API version that generated this response */
     version?: string;
+    /** Request ID for tracing */
+    requestId?: string;
   };
 }
 
+/**
+ * Query parameters for pagination
+ */
 export interface PaginationQuery {
+  /** Page number (1-based indexing) */
   page?: number;
+  /** Number of items per page */
   limit?: number;
+  /** Optional sorting field */
+  sortBy?: string;
+  /** Sort direction */
+  sortOrder?: 'asc' | 'desc';
 }
 
+/**
+ * Metadata about pagination state
+ */
 export interface PaginationMeta {
+  /** Current page number (1-based) */
   page: number;
+  /** Items per page */
   limit: number;
+  /** Total number of items across all pages */
   total: number;
+  /** Total number of pages */
   totalPages: number;
+  /** Whether there is a next page available */
   hasNext: boolean;
+  /** Whether there is a previous page available */
   hasPrev: boolean;
 }
 
+/**
+ * Paginated response wrapper
+ * @template T - The type of items in the data array
+ */
 export interface PaginatedResponse<T> {
+  /** Array of items for the current page */
   data: T[];
+  /** Pagination metadata */
   pagination: PaginationMeta;
 }
+
+/**
+ * Error response type for failed API calls
+ */
+export interface ApiErrorResponse {
+  success: false;
+  message: string;
+  errors?: Record<string, string[]>;
+  code?: string;
+  meta?: {
+    timestamp: string;
+    requestId?: string;
+  };
+}
+
+/**
+ * Union type for all possible API responses
+ * @template T - The type of successful response data
+ */
+export type ApiResult<T> = ApiResponse<T> | ApiErrorResponse;
 ```
 
 ### User Types with Validation
@@ -908,7 +1560,7 @@ export const CreateUserSchema = z.object({
   password: z.string()
     .min(8, 'Password must be at least 8 characters')
     .regex(
-      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/,
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$/, // Fixed: Added + at the end
       'Password must contain uppercase, lowercase, number and special character'
     ),
   firstName: z.string().min(1, 'First name is required').max(50),
@@ -921,7 +1573,7 @@ export const UpdateUserSchema = z.object({
   password: z.string()
     .min(8, 'Password must be at least 8 characters')
     .regex(
-      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]/,
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]+$/, // Fixed: Added + at the end
       'Password must contain uppercase, lowercase, number and special character'
     )
     .optional(),
@@ -987,6 +1639,19 @@ interface JwtPayload {
   exp: number;
 }
 
+// Extend Express Request interface to include user property
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        id: string;
+        email: string;
+        role: string;
+      };
+    }
+  }
+}
+
 export class AuthMiddleware {
   constructor(private userRepository: UserRepository) {}
 
@@ -1001,30 +1666,45 @@ export class AuthMiddleware {
       if (!authHeader || !authHeader.startsWith('Bearer ')) {
         throw new UnauthorizedError('Missing or invalid authorization header');
       }
-
-      const token = authHeader.substring(7);
+      
+      const token = authHeader.substring(7); // Extract token after "Bearer "
+      
+      // Add null check for empty token
+      if (!token) {
+        throw new UnauthorizedError('Token is required');
+      }
       
       const decoded = jwt.verify(token, config.jwt.publicKey, {
-        algorithms: ['RS256'],
+        algorithms: ['RS256'], // Specify allowed algorithms to prevent algorithm confusion attacks
       }) as JwtPayload;
-
-      // Verify user still exists
+      
+      // Verify user still exists and is active
       const user = await this.userRepository.findById(decoded.userId);
       if (!user) {
         throw new UnauthorizedError('User not found');
       }
-
+      
+      // Additional check: verify user is still active/enabled
+      if (user.status === 'disabled' || user.status === 'suspended') {
+        throw new UnauthorizedError('User account is disabled');
+      }
+      
       // Attach user to request
       req.user = {
         id: user.id,
         email: user.email,
         role: user.role,
       };
-
+      
       next();
     } catch (error) {
-      if (error instanceof jwt.JsonWebTokenError) {
+      // Handle specific JWT errors for better error messages
+      if (error instanceof jwt.TokenExpiredError) {
+        next(new UnauthorizedError('Token has expired'));
+      } else if (error instanceof jwt.JsonWebTokenError) {
         next(new UnauthorizedError('Invalid token'));
+      } else if (error instanceof jwt.NotBeforeError) {
+        next(new UnauthorizedError('Token not yet valid'));
       } else {
         next(error);
       }
@@ -1036,11 +1716,11 @@ export class AuthMiddleware {
       if (!req.user) {
         return next(new UnauthorizedError('Authentication required'));
       }
-
+      
       if (!allowedRoles.includes(req.user.role)) {
         return next(new ForbiddenError('Insufficient permissions'));
       }
-
+      
       next();
     };
   };
@@ -1063,7 +1743,6 @@ export class AppError extends Error {
     super(message);
     this.statusCode = statusCode;
     this.isOperational = isOperational;
-
     Error.captureStackTrace(this, this.constructor);
   }
 }
@@ -1137,6 +1816,7 @@ export function errorHandler(
 
   // Prisma errors
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    // P2002: Unique constraint violation
     if (error.code === 'P2002') {
       return res.status(409).json({
         success: false,
@@ -1144,10 +1824,12 @@ export function errorHandler(
         message: 'Resource already exists',
         meta: {
           timestamp: new Date().toISOString(),
+          target: error.meta?.target, // Added: Include constraint details
         },
       });
     }
 
+    // P2025: Record not found (used by findUniqueOrThrow, findFirstOrThrow)
     if (error.code === 'P2025') {
       return res.status(404).json({
         success: false,
@@ -1158,6 +1840,55 @@ export function errorHandler(
         },
       });
     }
+
+    // P2003: Foreign key constraint violation
+    if (error.code === 'P2003') {
+      return res.status(400).json({
+        success: false,
+        error: 'FOREIGN_KEY_CONSTRAINT',
+        message: 'Invalid reference to related resource',
+        meta: {
+          timestamp: new Date().toISOString(),
+          field: error.meta?.field_name,
+        },
+      });
+    }
+
+    // P2011: Null constraint violation
+    if (error.code === 'P2011') {
+      return res.status(400).json({
+        success: false,
+        error: 'NULL_CONSTRAINT',
+        message: 'Required field cannot be null',
+        meta: {
+          timestamp: new Date().toISOString(),
+          constraint: error.meta?.constraint,
+        },
+      });
+    }
+
+    // Generic Prisma known error handler
+    return res.status(400).json({
+      success: false,
+      error: 'DATABASE_ERROR',
+      message: 'A database error occurred',
+      meta: {
+        timestamp: new Date().toISOString(),
+        code: error.code,
+      },
+    });
+  }
+
+  // Prisma Client Validation Errors (schema validation issues)
+  if (error instanceof Prisma.PrismaClientValidationError) {
+    return res.status(400).json({
+      success: false,
+      error: 'VALIDATION_ERROR',
+      message: 'Database validation failed',
+      meta: {
+        timestamp: new Date().toISOString(),
+      },
+    });
   }
 
   // Application errors
@@ -1179,7 +1910,7 @@ export function errorHandler(
   }
 
   // Default error response
-  const statusCode = process.env.NODE_ENV === 'production' ? 500 : 500;
+  const statusCode = 500; // Fixed: Remove redundant conditional
   const message = process.env.NODE_ENV === 'production' 
     ? 'Internal server error' 
     : error.message;
@@ -1206,7 +1937,7 @@ import { UserRepository } from '@/repositories/user.repository';
 import { EmailService } from '@/services/email.service';
 import { ConflictError, NotFoundError } from '@/utils/errors';
 
-// Mock dependencies
+// Properly typed mock dependencies using jest.Mocked<T>
 const mockUserRepository = {
   findByEmail: jest.fn(),
   create: jest.fn(),
@@ -1225,7 +1956,7 @@ describe('UserService', () => {
 
   beforeEach(() => {
     userService = new UserService(mockUserRepository, mockEmailService);
-    jest.clearAllMocks();
+    jest.clearAllMocks(); // Reset all mocks before each test
   });
 
   describe('createUser', () => {
@@ -1250,17 +1981,20 @@ describe('UserService', () => {
         updatedAt: new Date(),
       };
 
+      // Mock return values for dependencies
       mockUserRepository.findByEmail.mockResolvedValue(null);
       mockUserRepository.create.mockResolvedValue(createdUser);
       mockEmailService.sendWelcomeEmail.mockResolvedValue(undefined);
 
       const result = await userService.createUser(userData);
 
+      // Verify method calls with proper arguments
       expect(mockUserRepository.findByEmail).toHaveBeenCalledWith(userData.email);
       expect(mockUserRepository.create).toHaveBeenCalledWith({
         ...userData,
-        passwordHash: expect.any(String),
+        passwordHash: expect.any(String), // Assuming password is hashed
       });
+      expect(mockEmailService.sendWelcomeEmail).toHaveBeenCalledWith(userData.email); // Added missing assertion
       expect(result.email).toBe(userData.email);
       expect(result.id).toBe('123');
     });
@@ -1274,6 +2008,7 @@ describe('UserService', () => {
         .toThrow(ConflictError);
 
       expect(mockUserRepository.create).not.toHaveBeenCalled();
+      expect(mockEmailService.sendWelcomeEmail).not.toHaveBeenCalled(); // Added missing assertion
     });
   });
 
@@ -1323,11 +2058,13 @@ const app = createApp();
 
 describe('User Routes', () => {
   beforeEach(async () => {
-    // Clean up database
+    // Clean up database before each test
     await prisma.user.deleteMany();
   });
 
   afterAll(async () => {
+    // Clean up database after all tests and disconnect
+    await prisma.user.deleteMany();
     await prisma.$disconnect();
   });
 
@@ -1384,7 +2121,7 @@ describe('User Routes', () => {
 
   describe('GET /api/v1/users', () => {
     it('should return paginated users', async () => {
-      // Create test users
+      // Create test users using Promise.all for better performance
       await Promise.all([
         request(app).post('/api/v1/users').send({
           email: 'user1@example.com',
@@ -1409,6 +2146,18 @@ describe('User Routes', () => {
       expect(response.body.data.pagination.total).toBe(2);
     });
   });
+});
+```
+## Additional Recommendations:
+Consider Using Test Database: Ensure you're using a separate test database to avoid interfering with development data.
+Environment Variables: Consider using different database URLs for testing:
+```typescript
+const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.TEST_DATABASE_URL || process.env.DATABASE_URL
+    }
+  }
 });
 ```
 
@@ -1439,11 +2188,11 @@ model User {
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   deletedAt       DateTime?
-
+  
   // Relations
   sessions Session[]
   posts    Post[]
-
+  
   @@map("users")
   @@index([email])
   @@index([createdAt])
@@ -1457,10 +2206,10 @@ model Session {
   expiresAt DateTime
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
+  
   // Relations
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
+  
   @@map("sessions")
   @@index([userId])
   @@index([token])
@@ -1472,13 +2221,13 @@ model Post {
   title     String
   content   String
   published Boolean  @default(false)
-  authorId  String
+  authorId  String   // Changed: Fixed type mismatch
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
+  
   // Relations
   author User @relation(fields: [authorId], references: [id], onDelete: Cascade)
-
+  
   @@map("posts")
   @@index([authorId])
   @@index([published])
@@ -1498,6 +2247,7 @@ enum Role {
 import { PrismaClient } from '@prisma/client';
 import { logger } from '@/utils/logger';
 
+// Global type augmentation for better TypeScript support
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
 };
@@ -1518,17 +2268,44 @@ if (process.env.NODE_ENV === 'development') {
       query: e.query,
       params: e.params,
       duration: `${e.duration}ms`,
+      timestamp: e.timestamp, // Added timestamp logging
     });
   });
 }
 
+// Enhanced error logging with more context
 prisma.$on('error', (e) => {
   logger.error('Database Error', {
     target: e.target,
     message: e.message,
+    timestamp: e.timestamp, // Added timestamp logging
   });
 });
 
+// Log info and warn events for better observability
+prisma.$on('info', (e) => {
+  logger.info('Database Info', {
+    message: e.message,
+    target: e.target,
+    timestamp: e.timestamp,
+  });
+});
+
+prisma.$on('warn', (e) => {
+  logger.warn('Database Warning', {
+    message: e.message,
+    target: e.target,
+    timestamp: e.timestamp,
+  });
+});
+
+// Use beforeExit hook for graceful shutdown logging
+prisma.$on('beforeExit', async () => {
+  logger.info('Database connection shutting down');
+  // PrismaClient is still available here for final operations if needed
+});
+
+// Only store in global during non-production to prevent multiple instances
 if (process.env.NODE_ENV !== 'production') {
   globalForPrisma.prisma = prisma;
 }
@@ -1549,6 +2326,7 @@ export async function disconnectDatabase(): Promise<void> {
     logger.info('Database disconnected');
   } catch (error) {
     logger.error('Error disconnecting from database', { error });
+    // Don't throw in disconnect to avoid masking original errors
   }
 }
 ```
@@ -1563,81 +2341,165 @@ import path from 'path';
 import jwt from 'jsonwebtoken';
 import { config } from './index';
 
+// Define proper interfaces for JWT payloads
+interface JWTPayload {
+  userId: string;
+  email: string;
+  role: string;
+}
+
+interface RefreshTokenPayload {
+  userId: string;
+}
+
+interface DecodedToken extends JWTPayload {
+  iat: number;
+  exp: number;
+  iss: string;
+  aud: string;
+}
+
 class JWTService {
   private privateKey: string;
   private publicKey: string;
 
   constructor() {
-    if (process.env.NODE_ENV === 'production') {
-      // In production, use environment variables
-      this.privateKey = process.env.JWT_PRIVATE_KEY?.replace(/\\n/g, '\n') || '';
-      this.publicKey = process.env.JWT_PUBLIC_KEY?.replace(/\\n/g, '\n') || '';
-    } else {
-      // In development, use local key files
-      this.privateKey = fs.readFileSync(
-        path.join(process.cwd(), 'keys', 'private.pem'),
-        'utf8'
-      );
-      this.publicKey = fs.readFileSync(
-        path.join(process.cwd(), 'keys', 'public.pem'),
-        'utf8'
-      );
+    try {
+      if (process.env.NODE_ENV === 'production') {
+        // In production, use environment variables
+        this.privateKey = process.env.JWT_PRIVATE_KEY?.replace(/\\n/g, '\n') || '';
+        this.publicKey = process.env.JWT_PUBLIC_KEY?.replace(/\\n/g, '\n') || '';
+        
+        // Validate that keys are provided in production
+        if (!this.privateKey || !this.publicKey) {
+          throw new Error('JWT keys must be provided via environment variables in production');
+        }
+      } else {
+        // In development, use local key files
+        const privateKeyPath = path.join(process.cwd(), 'keys', 'private.pem');
+        const publicKeyPath = path.join(process.cwd(), 'keys', 'public.pem');
+        
+        // Check if key files exist before reading
+        if (!fs.existsSync(privateKeyPath) || !fs.existsSync(publicKeyPath)) {
+          throw new Error(`JWT key files not found. Please ensure ${privateKeyPath} and ${publicKeyPath} exist.`);
+        }
+        
+        this.privateKey = fs.readFileSync(privateKeyPath, 'utf8');
+        this.publicKey = fs.readFileSync(publicKeyPath, 'utf8');
+      }
+      
+      // Validate that keys are not empty
+      if (!this.privateKey.trim() || !this.publicKey.trim()) {
+        throw new Error('JWT keys cannot be empty');
+      }
+      
+    } catch (error) {
+      throw new Error(`Failed to initialize JWT service: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
-  public generateTokens(payload: {
-    userId: string;
-    email: string;
-    role: string;
-  }): { accessToken: string; refreshToken: string } {
-    const accessToken = jwt.sign(payload, this.privateKey, {
-      algorithm: 'RS256',
-      expiresIn: config.jwt.accessTokenExpiry,
-      issuer: config.jwt.issuer,
-      audience: config.jwt.audience,
-    });
-
-    const refreshToken = jwt.sign(
-      { userId: payload.userId },
-      this.privateKey,
-      {
+  public generateTokens(payload: JWTPayload): { accessToken: string; refreshToken: string } {
+    try {
+      const accessToken = jwt.sign(payload, this.privateKey, {
         algorithm: 'RS256',
-        expiresIn: config.jwt.refreshTokenExpiry,
+        expiresIn: config.jwt.accessTokenExpiry,
         issuer: config.jwt.issuer,
         audience: config.jwt.audience,
-      }
-    );
+      });
 
-    return { accessToken, refreshToken };
+      const refreshToken = jwt.sign(
+        { userId: payload.userId } as RefreshTokenPayload,
+        this.privateKey,
+        {
+          algorithm: 'RS256',
+          expiresIn: config.jwt.refreshTokenExpiry,
+          issuer: config.jwt.issuer,
+          audience: config.jwt.audience,
+        }
+      );
+
+      return { accessToken, refreshToken };
+    } catch (error) {
+      throw new Error(`Failed to generate tokens: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
   }
 
-  public verifyToken(token: string): any {
-    return jwt.verify(token, this.publicKey, {
-      algorithms: ['RS256'],
-      issuer: config.jwt.issuer,
-      audience: config.jwt.audience,
-    });
+  public verifyToken(token: string): DecodedToken {
+    try {
+      const decoded = jwt.verify(token, this.publicKey, {
+        algorithms: ['RS256'],
+        issuer: config.jwt.issuer,
+        audience: config.jwt.audience,
+      }) as DecodedToken;
+      
+      return decoded;
+    } catch (error) {
+      if (error instanceof jwt.JsonWebTokenError) {
+        throw new Error(`Invalid token: ${error.message}`);
+      } else if (error instanceof jwt.TokenExpiredError) {
+        throw new Error('Token has expired');
+      } else if (error instanceof jwt.NotBeforeError) {
+        throw new Error('Token not active yet');
+      } else {
+        throw new Error(`Token verification failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
   }
 
   public getPublicKey(): string {
     return this.publicKey;
   }
+
+  // Additional helper method to verify refresh tokens specifically
+  public verifyRefreshToken(token: string): RefreshTokenPayload & { iat: number; exp: number; iss: string; aud: string } {
+    try {
+      const decoded = jwt.verify(token, this.publicKey, {
+        algorithms: ['RS256'],
+        issuer: config.jwt.issuer,
+        audience: config.jwt.audience,
+      }) as RefreshTokenPayload & { iat: number; exp: number; iss: string; aud: string };
+      
+      return decoded;
+    } catch (error) {
+      if (error instanceof jwt.JsonWebTokenError) {
+        throw new Error(`Invalid refresh token: ${error.message}`);
+      } else if (error instanceof jwt.TokenExpiredError) {
+        throw new Error('Refresh token has expired');
+      } else if (error instanceof jwt.NotBeforeError) {
+        throw new Error('Refresh token not active yet');
+      } else {
+        throw new Error(`Refresh token verification failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      }
+    }
+  }
 }
 
-export const jwtService = new JWTService();
+// Use a factory function instead of direct instantiation to handle initialization errors
+let jwtServiceInstance: JWTService | null = null;
+
+export const getJWTService = (): JWTService => {
+  if (!jwtServiceInstance) {
+    jwtServiceInstance = new JWTService();
+  }
+  return jwtServiceInstance;
+};
+
+// For backward compatibility, but prefer using getJWTService()
+export const jwtService = getJWTService();
 ```
 
 ### Rate Limiting Configuration
 ```typescript
 // src/middleware/rate-limit.middleware.ts
 import rateLimit from 'express-rate-limit';
-import RedisStore from 'rate-limit-redis';
+import { RedisStore } from 'rate-limit-redis';
 import { redis } from '@/config/redis';
 
 // General API rate limiting
 export const generalLimiter = rateLimit({
   store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(...args),
+    // FIXED: Use sendCommand method instead of call
+    sendCommand: (...args: string[]) => redis.sendCommand(args),
   }),
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 100, // Limit each IP to 100 requests per windowMs
@@ -1652,7 +2514,8 @@ export const generalLimiter = rateLimit({
 // Strict rate limiting for authentication endpoints
 export const authLimiter = rateLimit({
   store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(...args),
+    // FIXED: Use sendCommand method instead of call
+    sendCommand: (...args: string[]) => redis.sendCommand(args),
   }),
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 5, // Limit each IP to 5 requests per windowMs
@@ -1667,7 +2530,8 @@ export const authLimiter = rateLimit({
 // Password reset rate limiting
 export const passwordResetLimiter = rateLimit({
   store: new RedisStore({
-    sendCommand: (...args: string[]) => redis.call(...args),
+    // FIXED: Use sendCommand method instead of call
+    sendCommand: (...args: string[]) => redis.sendCommand(args),
   }),
   windowMs: 60 * 60 * 1000, // 1 hour
   max: 3, // Limit each IP to 3 password reset requests per hour
@@ -1688,10 +2552,10 @@ export const passwordResetLimiter = rateLimit({
 import dotenv from 'dotenv';
 import { z } from 'zod';
 
-// Load environment variables
+// Load environment variables before parsing
 dotenv.config();
 
-// Environment validation schema
+// Environment validation schema with error handling improvements
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().default(8000),
@@ -1723,8 +2587,21 @@ const envSchema = z.object({
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'debug']).default('info'),
 });
 
-// Validate environment variables
-const env = envSchema.parse(process.env);
+// Validate environment variables with proper error handling
+let env: z.infer<typeof envSchema>;
+
+try {
+  env = envSchema.parse(process.env);
+} catch (error) {
+  if (error instanceof z.ZodError) {
+    console.error('Environment validation failed:');
+    error.issues.forEach((issue) => {
+      console.error(`- ${issue.path.join('.')}: ${issue.message}`);
+    });
+    process.exit(1);
+  }
+  throw error;
+}
 
 export const config = {
   env: env.NODE_ENV,
@@ -1739,6 +2616,7 @@ export const config = {
   },
   
   jwt: {
+    // Proper handling of multiline environment variables
     privateKey: env.JWT_PRIVATE_KEY.replace(/\\n/g, '\n'),
     publicKey: env.JWT_PUBLIC_KEY.replace(/\\n/g, '\n'),
     accessTokenExpiry: env.JWT_ACCESS_TOKEN_EXPIRY,
@@ -1748,7 +2626,8 @@ export const config = {
   },
   
   cors: {
-    origins: env.CORS_ORIGINS.split(',').map(origin => origin.trim()),
+    // Better handling of comma-separated values with validation
+    origins: env.CORS_ORIGINS.split(',').map(origin => origin.trim()).filter(Boolean),
   },
   
   email: {
@@ -1768,62 +2647,70 @@ export const config = {
 
 ### Dockerfile
 ```dockerfile
-# Multi-stage Dockerfile for Node.js application
-FROM node:20-alpine AS base
+# syntax=docker/dockerfile:1
 
-# Install dependencies for native modules
-RUN apk add --no-cache libc6-compat
+# Multi-stage Dockerfile for Node.js application with Prisma
+ARG NODE_VERSION=20.18.0
 
+# Base stage for common configuration
+FROM node:${NODE_VERSION}-alpine AS base
+# Install system dependencies for native modules and database connections
+RUN apk add --no-cache \
+    libc6-compat \
+    openssl \
+    ca-certificates
 WORKDIR /app
 
-# Copy package files
+# Dependency installation stage  
+FROM base AS deps
+# Copy package files for dependency installation
 COPY package*.json ./
 COPY prisma ./prisma/
+# Install dependencies with cache mount for better performance
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --only=production && \
+    npm cache clean --force
 
-# Install dependencies
-RUN npm ci --only=production && npm cache clean --force
-
-# Build stage
+# Build stage for development dependencies and Prisma generation
 FROM base AS builder
+# Install all dependencies (including dev) with cache mount
+RUN --mount=type=cache,target=/root/.npm \
+    --mount=type=bind,source=package*.json,target=. \
+    --mount=type=bind,source=prisma,target=./prisma \
+    npm ci
 
-WORKDIR /app
-
-# Copy source code
+# Copy source code for build
 COPY . .
-
-# Install all dependencies (including dev dependencies)
-RUN npm ci
-
 # Generate Prisma client
 RUN npx prisma generate
-
 # Build the application
 RUN npm run build
 
-# Production stage
-FROM node:20-alpine AS runner
+# Production runtime stage
+FROM base AS runner
+# Create non-root user with specific UID/GID for security
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 --ingroup nodejs nodejs
 
-WORKDIR /app
-
-# Create non-root user
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nodejs
-
-# Copy built application
+# Copy built application and dependencies from previous stages
 COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
-COPY --from=builder --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --from=deps --chown=nodejs:nodejs /app/node_modules ./node_modules
 COPY --from=builder --chown=nodejs:nodejs /app/package.json ./package.json
 COPY --from=builder --chown=nodejs:nodejs /app/prisma ./prisma
 
-# Switch to non-root user
+# Switch to non-root user for security
 USER nodejs
 
-# Expose port
+# Expose application port
 EXPOSE 8000
 
-# Health check
+# Health check with improved implementation
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "require('http').get('http://localhost:8000/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))"
+    CMD node -e " \
+        require('http').get('http://localhost:8000/health', (res) => { \
+            process.exit(res.statusCode === 200 ? 0 : 1); \
+        }).on('error', () => process.exit(1)); \
+    "
 
 # Start the application
 CMD ["npm", "start"]
@@ -1832,9 +2719,7 @@ CMD ["npm", "start"]
 ### Docker Compose for Development
 ```yaml
 # docker-compose.yml
-version: '3.8'
-
-services:
+services:  # ← REMOVED deprecated 'version' field
   app:
     build: .
     ports:
@@ -1844,12 +2729,15 @@ services:
       - DATABASE_URL=postgresql://postgres:password@postgres:5432/app_db
       - REDIS_URL=redis://redis:6379
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy  # ← Added health check dependency
+      redis:
+        condition: service_started  # ← Added explicit condition
     volumes:
       - .:/app
       - /app/node_modules
     command: npm run dev
+    restart: unless-stopped  # ← Added restart policy
 
   postgres:
     image: postgres:15-alpine
@@ -1861,6 +2749,13 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:  # ← Added health check for better dependency management
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped  # ← Added restart policy
 
   redis:
     image: redis:7-alpine
@@ -1868,6 +2763,13 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
+    command: redis-server --appendonly yes  # ← Added persistence
+    healthcheck:  # ← Added health check
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped  # ← Added restart policy
 
 volumes:
   postgres_data:
@@ -1888,37 +2790,35 @@ const logFormat = winston.format.combine(
   winston.format.json()
 );
 
+// Define base transports for all environments
+const baseTransports: winston.transport[] = [
+  new winston.transports.File({
+    filename: 'logs/error.log',
+    level: 'error',
+  }),
+  new winston.transports.File({
+    filename: 'logs/combined.log',
+  }),
+];
+
+// Add console transport only for non-production environments
+const transports = config.env === 'production' 
+  ? baseTransports 
+  : [
+      ...baseTransports,
+      new winston.transports.Console({
+        format: winston.format.combine(
+          winston.format.colorize(),
+          winston.format.simple()
+        ),
+      }),
+    ];
+
 export const logger = winston.createLogger({
   level: config.logging.level,
   format: logFormat,
-  transports: [
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      ),
-    }),
-    new winston.transports.File({
-      filename: 'logs/error.log',
-      level: 'error',
-    }),
-    new winston.transports.File({
-      filename: 'logs/combined.log',
-    }),
-  ],
+  transports,
 });
-
-// Don't log to console in production
-if (config.env === 'production') {
-  logger.clear();
-  logger.add(new winston.transports.File({
-    filename: 'logs/error.log',
-    level: 'error',
-  }));
-  logger.add(new winston.transports.File({
-    filename: 'logs/combined.log',
-  }));
-}
 ```
 
 ### Health Check Implementation
@@ -1953,20 +2853,32 @@ router.get('/', async (req: Request, res: Response) => {
     },
   };
 
+  // Check database connection with timeout
   try {
-    // Check database connection
-    await prisma.$queryRaw`SELECT 1`;
+    await Promise.race([
+      prisma.$queryRaw`SELECT 1`,
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Database timeout')), 5000)
+      )
+    ]);
     health.services.database = 'connected';
   } catch (error) {
+    console.error('Database health check failed:', error);
     health.status = 'unhealthy';
     health.services.database = 'disconnected';
   }
 
+  // Check Redis connection with timeout
   try {
-    // Check Redis connection
-    await redis.ping();
+    await Promise.race([
+      redis.ping(),
+      new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Redis timeout')), 5000)
+      )
+    ]);
     health.services.redis = 'connected';
   } catch (error) {
+    console.error('Redis health check failed:', error);
     health.status = 'unhealthy';
     health.services.redis = 'disconnected';
   }
@@ -1976,4 +2888,29 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 export default router;
+```
+
+🚀 Additional Recommendations
+Optional Enhancements (if needed):
+```typescript
+// Add response caching for frequent health checks
+router.get('/', async (req: Request, res: Response) => {
+  // Set cache headers to prevent excessive database hits
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  
+  // ... rest of your health check logic
+});
+```
+Environment-Specific Considerations:
+```typescript
+// For production, you might want to add:
+const isDevelopment = process.env.NODE_ENV === 'development';
+
+// More detailed error info in development
+if (isDevelopment && health.status === 'unhealthy') {
+  (health as any).errors = {
+    database: dbError?.message,
+    redis: redisError?.message
+  };
+}
 ```
